@@ -20,8 +20,26 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: 3. Configure Android SDK (API 34 & Build-Tools 34.0.0)
+        shell: bash
+        run: |
+          set -e
+          export ANDROID_SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+
+          # Locate modern sdkmanager (avoids android-actions/setup-android@v3 requesting obsolete 'tools' package)
+          SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -z "$SDKMANAGER" ]; then
+            mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+            curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
+            unzip -q /tmp/cmdtools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+            mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest" || true
+            SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: 4. Set up Gradle 8.5
         uses: gradle/actions/setup-gradle@v3
@@ -33,7 +51,7 @@ jobs:
         run: |
           python3 -m pip install --quiet pillow
           python3 - << 'PYEOF'
-          import os, shutil
+          import glob, os, shutil
           from PIL import Image, ImageDraw, ImageFont
 
           ROOT = "android-app"
@@ -46,10 +64,19 @@ jobs:
           for d in [PKG_DIR, ASSETS_DIR, XML_DIR, VALUES_DIR]:
               os.makedirs(d, exist_ok=True)
 
-          # Copy index.html into Android assets
-          if not os.path.exists("index.html"):
-              raise FileNotFoundError("index.html must be in the root of your GitHub repository!")
-          shutil.copyfile("index.html", os.path.join(ASSETS_DIR, "index.html"))
+          # Locate index.html in repo root or subfolder
+          html_src = "index.html"
+          if not os.path.exists(html_src):
+              candidates = [p for p in glob.glob("**/*.html", recursive=True) if not p.startswith("android-app")]
+              if not candidates:
+                  raise FileNotFoundError("Could not find index.html in repository!")
+              html_src = candidates[0]
+          shutil.copyfile(html_src, os.path.join(ASSETS_DIR, "index.html"))
+
+          # Write local.properties with explicit sdk.dir
+          sdk_root = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME") or "/usr/local/lib/android/sdk"
+          with open(os.path.join(ROOT, "local.properties"), "w") as f:
+              f.write(f"sdk.dir={sdk_root}\n")
 
           # Generate Maths Manthan Launcher Icons across all densities
           sizes = {
@@ -66,7 +93,6 @@ jobs:
               draw = ImageDraw.Draw(img)
               r = int(sz * 0.22)
               draw.rounded_rectangle([(0, 0), (sz - 1, sz - 1)], radius=r, fill=(55, 48, 163, 255))
-              # Draw bold Sigma symbol centered
               try:
                   font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", int(sz * 0.58))
               except Exception:
@@ -120,6 +146,7 @@ jobs:
           android {
               namespace 'in.mathsmanthan.app'
               compileSdk 34
+              buildToolsVersion "34.0.0"
 
               defaultConfig {
                   applicationId "in.mathsmanthan.app"
@@ -161,7 +188,7 @@ jobs:
           }
           """)
 
-          # 5. res/xml/file_paths.xml (for FileProvider sharing of receipts & backups)
+          # 5. res/xml/file_paths.xml
           with open(os.path.join(XML_DIR, "file_paths.xml"), "w") as f:
               f.write("""<?xml version="1.0" encoding="utf-8"?>
           <paths>
@@ -187,9 +214,7 @@ jobs:
               f.write("""<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-              <!-- Camera permission for live student photo capture -->
               <uses-permission android:name="android.permission.CAMERA" />
-              <!-- Legacy storage permissions for older Android versions (Android 10+ uses system picker & MediaStore automatically) -->
               <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
@@ -236,7 +261,7 @@ jobs:
           </manifest>
           """)
 
-          # 8. MainActivity.java (Full WebChromeClient.onShowFileChooser + Camera Permission + Offline Download/Share Bridge)
+          # 8. MainActivity.java
           with open(os.path.join(PKG_DIR, "MainActivity.java"), "w") as f:
               f.write(r"""package in.mathsmanthan.app;
 
@@ -283,12 +308,9 @@ jobs:
               private final ActivityResultLauncher<Intent> fileChooserLauncher =
                   registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
                       if (filePathCallback == null) return;
-                      Uri[] results = null;
-                      if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
-                          String dataString = result.getData().getDataString();
-                          if (dataString != null) {
-                              results = new Uri[]{Uri.parse(dataString)};
-                          }
+                      Uri[] results = WebChromeClient.FileChooserParams.parseResult(result.getResultCode(), result.getData());
+                      if (results == null && result.getResultCode() == Activity.RESULT_OK && result.getData() != null && result.getData().getData() != null) {
+                          results = new Uri[]{result.getData().getData()};
                       }
                       filePathCallback.onReceiveValue(results);
                       filePathCallback = null;
@@ -330,7 +352,6 @@ jobs:
                   });
 
                   webView.setWebChromeClient(new WebChromeClient() {
-                      // Fixes Gallery Photo Upload & Backup File Restore (<input type="file">)
                       @Override
                       public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
                           if (MainActivity.this.filePathCallback != null) {
@@ -365,7 +386,6 @@ jobs:
                           return true;
                       }
 
-                      // Fixes Live Camera inside WebView (navigator.mediaDevices.getUserMedia)
                       @Override
                       public void onPermissionRequest(final PermissionRequest request) {
                           if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
