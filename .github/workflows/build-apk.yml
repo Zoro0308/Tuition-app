@@ -1,0 +1,527 @@
+name: Build Maths Manthan Offline APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Compile Native Offline Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 4. Set up Gradle 8.5
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: 5. Scaffold Android WebView Wrapper (Gallery, Camera & Offline Bridge)
+        shell: bash
+        run: |
+          python3 -m pip install --quiet pillow
+          python3 - << 'PYEOF'
+          import os, shutil
+          from PIL import Image, ImageDraw, ImageFont
+
+          ROOT = "android-app"
+          PKG_DIR = os.path.join(ROOT, "app/src/main/java/in/mathsmanthan/app")
+          ASSETS_DIR = os.path.join(ROOT, "app/src/main/assets")
+          RES_DIR = os.path.join(ROOT, "app/src/main/res")
+          XML_DIR = os.path.join(RES_DIR, "xml")
+          VALUES_DIR = os.path.join(RES_DIR, "values")
+
+          for d in [PKG_DIR, ASSETS_DIR, XML_DIR, VALUES_DIR]:
+              os.makedirs(d, exist_ok=True)
+
+          # Copy index.html into Android assets
+          if not os.path.exists("index.html"):
+              raise FileNotFoundError("index.html must be in the root of your GitHub repository!")
+          shutil.copyfile("index.html", os.path.join(ASSETS_DIR, "index.html"))
+
+          # Generate Maths Manthan Launcher Icons across all densities
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+          for folder, sz in sizes.items():
+              mdir = os.path.join(RES_DIR, folder)
+              os.makedirs(mdir, exist_ok=True)
+              img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+              draw = ImageDraw.Draw(img)
+              r = int(sz * 0.22)
+              draw.rounded_rectangle([(0, 0), (sz - 1, sz - 1)], radius=r, fill=(55, 48, 163, 255))
+              # Draw bold Sigma symbol centered
+              try:
+                  font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", int(sz * 0.58))
+              except Exception:
+                  font = ImageFont.load_default()
+              bbox = draw.textbbox((0, 0), "∑", font=font)
+              tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+              draw.text(((sz - tw) / 2 - bbox[0], (sz - th) / 2 - bbox[1]), "∑", fill=(255, 255, 255, 255), font=font)
+              img.save(os.path.join(mdir, "ic_launcher.png"))
+              img.save(os.path.join(mdir, "ic_launcher_round.png"))
+
+          # 1. settings.gradle
+          with open(os.path.join(ROOT, "settings.gradle"), "w") as f:
+              f.write("""pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MathsManthan"
+          include ':app'
+          """)
+
+          # 2. root build.gradle
+          with open(os.path.join(ROOT, "build.gradle"), "w") as f:
+              f.write("""plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          """)
+
+          # 3. gradle.properties
+          with open(os.path.join(ROOT, "gradle.properties"), "w") as f:
+              f.write("""org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          """)
+
+          # 4. app/build.gradle
+          with open(os.path.join(ROOT, "app/build.gradle"), "w") as f:
+              f.write("""plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'in.mathsmanthan.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "in.mathsmanthan.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 3
+                  versionName "3.0-offline"
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file("release-key.jks")
+                      storePassword "mathsmanthan"
+                      keyAlias "mathsmanthan"
+                      keyPassword "mathsmanthan"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled false
+                  }
+                  debug {
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'androidx.core:core:1.12.0'
+              implementation 'androidx.activity:activity:1.8.2'
+          }
+          """)
+
+          # 5. res/xml/file_paths.xml (for FileProvider sharing of receipts & backups)
+          with open(os.path.join(XML_DIR, "file_paths.xml"), "w") as f:
+              f.write("""<?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="shared_files" path="." />
+              <external-path name="external_files" path="." />
+          </paths>
+          """)
+
+          # 6. res/values/styles.xml
+          with open(os.path.join(VALUES_DIR, "styles.xml"), "w") as f:
+              f.write("""<?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar">
+                  <item name="android:statusBarColor">#1E1B4B</item>
+                  <item name="android:navigationBarColor">#FFFFFF</item>
+                  <item name="android:windowLightStatusBar">false</item>
+              </style>
+          </resources>
+          """)
+
+          # 7. AndroidManifest.xml
+          with open(os.path.join(ROOT, "app/src/main/AndroidManifest.xml"), "w") as f:
+              f.write("""<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Camera permission for live student photo capture -->
+              <uses-permission android:name="android.permission.CAMERA" />
+              <!-- Legacy storage permissions for older Android versions (Android 10+ uses system picker & MediaStore automatically) -->
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+
+              <queries>
+                  <package android:name="com.whatsapp" />
+                  <package android:name="com.whatsapp.w4b" />
+                  <intent>
+                      <action android:name="android.intent.action.GET_CONTENT" />
+                      <data android:mimeType="*/*" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="Maths Manthan"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          """)
+
+          # 8. MainActivity.java (Full WebChromeClient.onShowFileChooser + Camera Permission + Offline Download/Share Bridge)
+          with open(os.path.join(PKG_DIR, "MainActivity.java"), "w") as f:
+              f.write(r"""package in.mathsmanthan.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.PermissionRequest;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Toast;
+
+          import androidx.activity.OnBackPressedCallback;
+          import androidx.activity.result.ActivityResultLauncher;
+          import androidx.activity.result.contract.ActivityResultContracts;
+          import androidx.annotation.NonNull;
+          import androidx.appcompat.app.AppCompatActivity;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import androidx.core.content.FileProvider;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+
+          public class MainActivity extends AppCompatActivity {
+              private WebView webView;
+              private ValueCallback<Uri[]> filePathCallback;
+              private PermissionRequest pendingWebPermissionRequest;
+              private static final int CAMERA_PERMISSION_REQ_CODE = 1001;
+
+              private final ActivityResultLauncher<Intent> fileChooserLauncher =
+                  registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+                      if (filePathCallback == null) return;
+                      Uri[] results = null;
+                      if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+                          String dataString = result.getData().getDataString();
+                          if (dataString != null) {
+                              results = new Uri[]{Uri.parse(dataString)};
+                          }
+                      }
+                      filePathCallback.onReceiveValue(results);
+                      filePathCallback = null;
+                  });
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setAllowFileAccessFromFileURLs(true);
+                  settings.setAllowUniversalAccessFromFileURLs(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  // Strict 100% offline mode: block external network traffic
+                  settings.setBlockNetworkLoads(true);
+
+                  webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                          if (url != null && (url.startsWith("whatsapp://") || url.startsWith("tel:") || url.startsWith("sms:"))) {
+                              try {
+                                  Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                                  startActivity(intent);
+                              } catch (Exception e) {
+                                  Toast.makeText(MainActivity.this, "App not installed on device", Toast.LENGTH_SHORT).show();
+                              }
+                              return true;
+                          }
+                          return false;
+                      }
+                  });
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      // Fixes Gallery Photo Upload & Backup File Restore (<input type="file">)
+                      @Override
+                      public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
+                          if (MainActivity.this.filePathCallback != null) {
+                              MainActivity.this.filePathCallback.onReceiveValue(null);
+                          }
+                          MainActivity.this.filePathCallback = filePathCallback;
+
+                          String mimeType = "*/*";
+                          if (fileChooserParams != null && fileChooserParams.getAcceptTypes() != null && fileChooserParams.getAcceptTypes().length > 0) {
+                              String firstType = fileChooserParams.getAcceptTypes()[0];
+                              if (firstType != null && !firstType.trim().isEmpty()) {
+                                  if (firstType.contains("image")) {
+                                      mimeType = "image/*";
+                                  } else {
+                                      mimeType = "*/*";
+                                  }
+                              }
+                          }
+
+                          Intent contentSelectionIntent = new Intent(Intent.ACTION_GET_CONTENT);
+                          contentSelectionIntent.addCategory(Intent.CATEGORY_OPENABLE);
+                          contentSelectionIntent.setType(mimeType);
+
+                          Intent chooserIntent = Intent.createChooser(contentSelectionIntent, "Select File or Photo");
+                          try {
+                              fileChooserLauncher.launch(chooserIntent);
+                          } catch (Exception e) {
+                              MainActivity.this.filePathCallback = null;
+                              Toast.makeText(MainActivity.this, "Cannot open file picker", Toast.LENGTH_SHORT).show();
+                              return false;
+                          }
+                          return true;
+                      }
+
+                      // Fixes Live Camera inside WebView (navigator.mediaDevices.getUserMedia)
+                      @Override
+                      public void onPermissionRequest(final PermissionRequest request) {
+                          if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                              request.grant(request.getResources());
+                          } else {
+                              pendingWebPermissionRequest = request;
+                              ActivityCompat.requestPermissions(MainActivity.this, new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQ_CODE);
+                          }
+                      }
+                  });
+
+                  getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+                      @Override
+                      public void handleOnBackPressed() {
+                          webView.evaluateJavascript("window.handleAndroidBack ? window.handleAndroidBack() : false", value -> {
+                              if ("true".equals(value)) {
+                                  return;
+                              }
+                              if (webView.canGoBack()) {
+                                  webView.goBack();
+                              } else {
+                                  finish();
+                              }
+                          });
+                      }
+                  });
+
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == CAMERA_PERMISSION_REQ_CODE && pendingWebPermissionRequest != null) {
+                      if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                          pendingWebPermissionRequest.grant(pendingWebPermissionRequest.getResources());
+                      } else {
+                          pendingWebPermissionRequest.deny();
+                      }
+                      pendingWebPermissionRequest = null;
+                  }
+              }
+
+              public class AndroidBridge {
+                  @JavascriptInterface
+                  public void saveFileBase64(String base64Data, String fileName, String mimeType) {
+                      try {
+                          byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                          saveBytesToDownloads(bytes, fileName, mimeType);
+                      } catch (Exception e) {
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Save failed: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void shareFileBase64(String base64Data, String fileName, String mimeType, String title) {
+                      try {
+                          byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                          File cacheFile = new File(getCacheDir(), fileName);
+                          try (FileOutputStream fos = new FileOutputStream(cacheFile)) {
+                              fos.write(bytes);
+                          }
+                          Uri uri = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".fileprovider", cacheFile);
+                          Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                          shareIntent.setType(mimeType);
+                          shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
+                          shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                          startActivity(Intent.createChooser(shareIntent, title != null ? title : "Share File"));
+                      } catch (Exception e) {
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Share failed: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void saveOrShareTextFile(String content, String fileName, String mimeType) {
+                      try {
+                          byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+                          saveBytesToDownloads(bytes, fileName, mimeType);
+                          File cacheFile = new File(getCacheDir(), fileName);
+                          try (FileOutputStream fos = new FileOutputStream(cacheFile)) {
+                              fos.write(bytes);
+                          }
+                          Uri uri = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".fileprovider", cacheFile);
+                          Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                          shareIntent.setType(mimeType);
+                          shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
+                          shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                          startActivity(Intent.createChooser(shareIntent, "Save or Share " + fileName));
+                      } catch (Exception e) {
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Export error: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void shareText(String text, String title) {
+                      Intent sendIntent = new Intent(Intent.ACTION_SEND);
+                      sendIntent.setType("text/plain");
+                      sendIntent.putExtra(Intent.EXTRA_TEXT, text);
+                      startActivity(Intent.createChooser(sendIntent, title != null ? title : "Share Report"));
+                  }
+
+                  @JavascriptInterface
+                  public void openWhatsApp(String phone, String text) {
+                      try {
+                          String url = (phone != null && !phone.isEmpty())
+                              ? "whatsapp://send?phone=" + Uri.encode(phone) + "&text=" + Uri.encode(text)
+                              : "whatsapp://send?text=" + Uri.encode(text);
+                          Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                          startActivity(intent);
+                      } catch (Exception e) {
+                          shareText(text, "Send Report");
+                      }
+                  }
+
+                  private void saveBytesToDownloads(byte[] bytes, String fileName, String mimeType) throws Exception {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          ContentValues values = new ContentValues();
+                          values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+                          values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
+                          values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                          Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                          if (uri != null) {
+                              try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                                  if (os != null) os.write(bytes);
+                              }
+                          }
+                      } else {
+                          File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                          if (!dir.exists()) dir.mkdirs();
+                          File outFile = new File(dir, fileName);
+                          try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                              fos.write(bytes);
+                          }
+                      }
+                      runOnUiThread(() -> Toast.makeText(MainActivity.this, "Saved to Downloads: " + fileName, Toast.LENGTH_SHORT).show());
+                  }
+              }
+          }
+          """)
+          PYEOF
+
+      - name: 6. Generate Signing Key & Build Signed Offline APK
+        working-directory: android-app
+        run: |
+          keytool -genkeypair -v \
+            -keystore app/release-key.jks \
+            -alias mathsmanthan \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass mathsmanthan -keypass mathsmanthan \
+            -dname "CN=Manthan Ahlawat, OU=Maths Manthan, O=Maths Manthan, L=Meerut, ST=UP, C=IN"
+          gradle assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk ../Maths-Manthan-Offline.apk
+
+      - name: 7. Upload Compiled APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maths-Manthan-Offline-APK
+          path: Maths-Manthan-Offline.apk
+          retention-days: 90
